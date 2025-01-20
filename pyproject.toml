@@ -21,7 +21,7 @@ classifiers = [
 description = "Amortizing Bayesian Inferene With Neural Networks"
 license = { file = "LICENSE" }
 
-requires-python = ">= 3.10, < 3.12"
+requires-python = ">= 3.10"
 dependencies = [
     "keras ~= 3.7.0",
     "numpy ~= 1.26.4",
