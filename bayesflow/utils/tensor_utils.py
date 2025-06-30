@@ -20,6 +20,14 @@ def concatenate_valid(tensors: Sequence[Tensor | None], axis: int = 0) -> Tensor
     return keras.ops.concatenate(tensors, axis=axis)
 
 
+def repeat_valid(x: Tensor, repeats: int, axis: int = 0) -> Tensor | None:
+    """Repeat tensor along axis, ignoring None values."""
+    if x is None:
+        return None
+
+    return keras.ops.repeat(x, repeats=repeats, axis=axis)
+
+
 def concatenate_valid_shapes(tensor_shapes: Sequence[Shape | None], axis: int = 0) -> Shape | None:
     tensor_shapes = [s for s in tensor_shapes if s is not None]
     if not tensor_shapes:
