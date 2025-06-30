@@ -20,6 +20,7 @@ class OnlineDataset(keras.utils.PyDataset):
         adapter: Adapter | None,
         *,
         augmentations: Callable | Mapping[str, Callable] | Sequence[Callable] = None,
+        static_data: Mapping[str, np.ndarray] = None,
         **kwargs,
     ):
         """
@@ -46,6 +47,8 @@ class OnlineDataset(keras.utils.PyDataset):
 
             Note - augmentations are applied before the adapter is called and are generally
             transforms that you only want to apply during training.
+        static_data: Mapping[str, np.ndarray]
+            Any data that should be always present in the batch unchanged.
         **kwargs
             Additional keyword arguments passed to the base `PyDataset`.
         """
@@ -56,6 +59,7 @@ class OnlineDataset(keras.utils.PyDataset):
         self.adapter = adapter
         self.simulator = simulator
         self.augmentations = augmentations or []
+        self.static_data = static_data
 
     def __getitem__(self, item: int) -> dict[str, np.ndarray]:
         """
@@ -88,6 +92,9 @@ class OnlineDataset(keras.utils.PyDataset):
 
         if self.adapter is not None:
             batch = self.adapter(batch)
+
+        if self.static_data is not None:
+            batch = batch | self.static_data
 
         return batch
 

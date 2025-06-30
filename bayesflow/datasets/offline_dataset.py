@@ -24,6 +24,7 @@ class OfflineDataset(keras.utils.PyDataset):
         *,
         augmentations: Callable | Mapping[str, Callable] | Sequence[Callable] = None,
         shuffle: bool = True,
+        static_data: Mapping[str, np.ndarray] = None,
         **kwargs,
     ):
         """
@@ -52,6 +53,8 @@ class OfflineDataset(keras.utils.PyDataset):
             transforms that you only want to apply during training.
         shuffle : bool, optional
             Whether to shuffle the dataset at initialization and at the end of each epoch. Default is True.
+        static_data: Mapping[str, np.ndarray]
+            Any data that should be always present in the batch unchanged.
         **kwargs
             Additional keyword arguments passed to the base `PyDataset`.
         """
@@ -72,6 +75,8 @@ class OfflineDataset(keras.utils.PyDataset):
         self._shuffle = shuffle
         if self._shuffle:
             self.shuffle()
+
+        self.static_data = static_data
 
     def __getitem__(self, item: int) -> dict[str, np.ndarray]:
         """
@@ -118,6 +123,9 @@ class OfflineDataset(keras.utils.PyDataset):
 
         if self.adapter is not None:
             batch = self.adapter(batch)
+
+        if self.static_data is not None:
+            batch = batch | self.static_data
 
         return batch
 
