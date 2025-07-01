@@ -7,7 +7,7 @@ from .approximator import Approximator
 from .continuous_approximator import ContinuousApproximator
 from .point_approximator import PointApproximator
 from .model_comparison_approximator import ModelComparisonApproximator
-from .self_consistent_continuous_approximator import SelfConsistentContinuousApproximator
+from .self_consistent_approximator import SelfConsistentApproximator
 
 from ..utils._docs import _add_imports_to_all
 

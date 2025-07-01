@@ -23,7 +23,46 @@ from bayesflow.utils.serialization import serializable, serialize, deserialize
 
 
 @serializable("bayesflow.approximators")
-class SelfConsistentContinuousApproximator(Approximator):
+class SelfConsistentApproximator(Approximator):
+    """
+    Defines a workflow for performing fast posterior inference.
+    The posterior is approximated with a posterior network and
+    an optional summary network trained with a self-consistency loss.
+
+    To calculate the self-consistency loss, one needs to supply the prior and likelihood.
+    Both can be either analytic distributions or approximated via inference networks.
+
+    Parameters
+    ----------
+    adapter: bayesflow.adapters.Adapter
+        Adapter for data processing.
+    prior_network: bayesflow.networks.InferenceNetwork | bayesflow.distributions.Distribution
+        Prior distribution of the parameters.
+        Needs to be an instance of a class with `.log_prob` method.
+    likelihood_network: bayesflow.networks.InferenceNetwork | bayesflow.distributions.Distribution
+        Likelihood of the data given parameters.
+        Needs to be an instance of a class with `.log_prob` method.
+    posterior_network: bayesflow.networks.InferenceNetwork | bayesflow.distributions.Distribution
+        Posterior of the parameters given data.
+        Needs to be an instance of a class with `.log_prob` and `.sample` methods.
+    summary_network: bayesflow.networks.SummaryNetwork, optional
+        The summary network used for data summarization.
+    standardize: str | Sequence[str] | None
+        The variables to standardize before passing to the networks. Can be either
+        "all" or any subset of ["inference_variables", "summary_variables", "inference_conditions"].
+        (default is "all").
+    num_sc_samples: int
+        Number of posterior samples over which to calculate
+        the variance of the marginal likelihood approximation during training (for SC loss).
+    likelihood_summary: bool
+        Whether or not is the likelihood computed on the output
+        of the summary network (`True`) or on the raw data (`False`).
+        Note that when `True`, the `.log_marginal_likelihood` returns
+        biased estimates that are not to be used for model comparison.
+    **kwargs : dict, optional
+        Additional arguments passed to the :py:class:`bayesflow.approximators.Approximator` class.
+    """
+
     def __init__(
         self,
         adapter: Adapter,
@@ -124,7 +163,37 @@ class SelfConsistentContinuousApproximator(Approximator):
         sc_conditions: Tensor = None,
         stage: str = "training",
         **kwargs,
-    ):
+    ) -> dict[str, Tensor]:
+        """
+        Computes loss and tracks metrics for the prior, likelihood, posterior, and summary networks.
+
+        This method orchestrates the end-to-end computation of metrics and loss for the model.
+        It handles standardization of input variables, combines summary outputs with conditions when necessary,
+        and aggregates loss and all tracked metrics into a unified dictionary. The returned dictionary
+        includes both the total loss and all individual metrics, with keys indicating their source.
+
+        Parameters
+        ----------
+        parameters: Tensor
+            Input tensors for the posterior network, and conditioning tensor for the likelihood network.
+        data: Tensor
+            Input tensors for the summary network and likelihood network.
+        conditions: Tensor
+            Conditioning tensors for all inference networks (prior, likelihood, and posterior).
+        sc_data: Tensor
+            Input tensor for the posterior network for calculating the SC loss.
+        sc_condition: Tensor
+            Conditioning tensors for all inference networks (prior, likelihood, and posterior)
+              for calculating the SC loss.
+
+        Returns
+        -------
+        metrics: dict[str, Tensor]
+            Dictionary containing the total loss under the key "loss",
+            as well as all tracked metrics for the prior, likelihood, posterior, and summary networks.
+            Each metric key is prefixed with
+            "prior_", "likelihood_", "posterior_", or "summary_" to indicate its source.
+        """
         # standardize inputs before doing any computations
         if "parameters" in self.standardize:
             if parameters is not None:
@@ -233,6 +302,31 @@ class SelfConsistentContinuousApproximator(Approximator):
         return metrics, loss
 
     def log_marginal_likelihood(self, num_samples: int, conditions: Mapping[str, np.ndarray], **kwargs) -> np.ndarray:
+        """
+        Estimates the log marginal likelihood log p(y) = log ∫ p(θ) p(y | θ) dθ by inverting the Bayes' theorem:
+        p(y) = p(y | θ) p(θ) / p(θ | y), where the posterior, likelihood, or prior densities may be approximated.
+
+        The RHS is evaluated on samples from the posterior θ_1, ..., θ_k ~ p(θ | y)
+
+        Note that when using approximate likelihood on a summary space h(y),
+        the estimate of the likelihood is biased by an unknown factor of f(y): p(y | θ) = f(y) p(h(y) | θ)
+        (see Fisher-Neyman factorization theorem).
+        Therefore, the estimated marginal likelihood cannot be used for model comparison because p(y) != p(h(y)).
+
+        Parameters
+        ----------
+        num_samples: int
+            Number of posterior samples to evaluate the marginal likelihood on.
+        conditions : dict[str, np.ndarray]
+            Dictionary of conditioning variables as NumPy arrays.
+        **kwargs : dict
+            Additional keyword arguments for the adapter.
+
+        Returns
+        -------
+        np.ndarray
+            Estimates of the log marginal likelihood, averaged over `num_samples`.
+        """
         if self.likelihood_summary:
             logging.warning(
                 "Estimates of the marginal likelihood are biased "
