@@ -1,13 +1,16 @@
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+
+import numpy as np
 
 import keras
+
 from bayesflow.types import Tensor
 from bayesflow.adapters import Adapter
 from bayesflow.approximators import Approximator
 from bayesflow.networks.inference_network import InferenceNetwork
 from bayesflow.networks.summary_network import SummaryNetwork
 from bayesflow.distributions.distribution import Distribution
-from bayesflow.utils.logging import concatenate_valid_shapes, concatenate_valid, repeat_valid
+from bayesflow.utils import filter_kwargs, concatenate_valid_shapes, concatenate_valid, repeat_valid, split_arrays
 from bayesflow.networks.standardization import Standardization
 from bayesflow.utils.serialization import serializable, serialize, deserialize
 
@@ -36,7 +39,7 @@ class SelfConsistentContinuousApproximator(Approximator):
         self.num_sc_samples = num_sc_samples
         if likelihood_summary and summary_network is None:
             raise ValueError("Summary network needs to be defined for computing the summary likelihood.")
-        self.likehood_summary = likelihood_summary
+        self.likelihood_summary = likelihood_summary
 
         if isinstance(standardize, str) and standardize != "all":
             self.standardize = [standardize]
@@ -56,17 +59,20 @@ class SelfConsistentContinuousApproximator(Approximator):
             data_summary_shape = self.summary_network.compute_output_shape(data_shapes["data"])
 
         if isinstance(self.prior_network, InferenceNetwork) and not self.prior_network.built:
-            self.prior_network.build(data_shapes["parameters"], data_shapes["conditions"])
+            self.prior_network.build(data_shapes["parameters"], data_shapes.get("conditions"))
 
         if isinstance(self.likelihood_network, InferenceNetwork) and not self.likelihood_network.built:
-            if self.likehood_summary:
-                self.likelihood_network.build(data_summary_shape, data_shapes["conditions"])
+            likelihood_conditions_shape = concatenate_valid_shapes(
+                (data_shapes["parameters"], data_shapes.get("conditions"))
+            )
+            if self.likelihood_summary:
+                self.likelihood_network.build(data_summary_shape, likelihood_conditions_shape)
             else:
-                self.likelihood_network.build(data_shapes["data"], data_shapes["conditions"])
+                self.likelihood_network.build(data_shapes["data"], likelihood_conditions_shape)
 
         if isinstance(self.posterior_network, InferenceNetwork) and not self.posterior_network.built:
-            posterior_conditions_shape = concatenate_valid_shapes(data_summary_shape, data_shapes["conditions"])
-            self.posterior_network(data_shapes["parameters"], posterior_conditions_shape)
+            posterior_conditions_shape = concatenate_valid_shapes((data_summary_shape, data_shapes.get("conditions")))
+            self.posterior_network.build(data_shapes["parameters"], posterior_conditions_shape)
 
         if self.standardize == "all":
             self.standardize = [var for var in ["parameters", "data", "conditions"] if var in data_shapes]
@@ -93,10 +99,13 @@ class SelfConsistentContinuousApproximator(Approximator):
             "posterior_network": self.posterior_network,
             "standardize": self.standardize,
             "num_sc_samples": self.num_sc_samples,
-            "likelihood_summary": self.likehood_summary,
+            "likelihood_summary": self.likelihood_summary,
         }
 
         return base_config | serialize(config)
+
+    def _batch_size_from_data(self, data: any):
+        return keras.ops.shape(data["parameters"])[0]
 
     def compute_metrics(
         self,
@@ -235,7 +244,7 @@ class SelfConsistentContinuousApproximator(Approximator):
         # evaluate prior, likelihood, and posterior
         log_prior = self.prior_network.log_prob(samples=parameters, conditions=conditions)
         log_likelihood = self.likelihood_network.log_prob(
-            samples=data_summary if self.likehood_summary else data,
+            samples=data_summary if self.likelihood_summary else data,
             conditions=concatenate_valid((parameters, conditions), axis=-1),
         )
         log_posterior = self.posterior_network.log_prob(samples=parameters, conditions=posterior_conditions)
@@ -246,3 +255,76 @@ class SelfConsistentContinuousApproximator(Approximator):
         log_ml = keras.ops.reshape(log_ml, newshape=(batch_size, num_samples))
 
         return log_ml
+
+    def sample(
+        self, *, num_samples: int, conditions: Mapping[str, np.ndarray], split: bool = False, **kwargs
+    ) -> dict[str, np.ndarray]:
+        """
+        Generates samples from the posterior network given data and conditions.
+        The `conditions` dictionary is preprocessed using the `adapter`.
+        Samples are converted into NumPy arrays after inference.
+
+        Parameters
+        ----------
+        num_samples : int
+            Number of samples to generate.
+        conditions : dict[str, np.ndarray]
+            Dictionary of conditioning variables as NumPy arrays.
+        split : bool, default=False
+            Whether to split the output arrays along the last axis and return one column vector per target variable
+            samples.
+        **kwargs : dict
+            Additional keyword arguments for the adapter and sampling process.
+
+        Returns
+        -------
+        dict[str, np.ndarray]
+            Dictionary containing generated samples with the same keys as `conditions`.
+        """
+        conditions = self.adapter(conditions, strict=False, stage="inference", **kwargs)
+
+        for key in ["data", "conditions"]:
+            if key in self.standardize and key in conditions:
+                conditions[key] = self.standardize_layers[key](conditions[key])
+
+        conditions = keras.tree.map_structure(keras.ops.convert_to_tensor, conditions)
+
+        conditions = {k: v for k, v in conditions.items() if k in ["data", "conditions"]}
+
+        samples = self._sample(num_samples=num_samples, **conditions, **kwargs)
+
+        if "parameters" in self.standardize:
+            samples = self.standardize_layers["parameters"](samples, forward=False)
+
+        samples = {"parameters": samples}
+        samples = keras.tree.map_structure(keras.ops.convert_to_numpy, samples)
+        samples = self.adapter(samples, inverse=True, strict=False)
+
+        if split:
+            samples = split_arrays(samples)
+
+        return samples
+
+    def _sample(self, num_samples: int, data: Tensor = None, conditions: Tensor = None, **kwargs) -> Tensor:
+        if self.summary_network is not None:
+            if data is None:
+                raise ValueError("Data are required when summary network is present")
+
+            data = self.summary_network(data, **filter_kwargs(kwargs, self.summary_network.call))
+
+        inference_conditions = concatenate_valid((data, conditions), axis=-1)
+
+        if inference_conditions is not None:
+            # conditions must always have shape (batch_size, ..., dims)
+            batch_size = keras.ops.shape(inference_conditions)[0]
+            inference_conditions = keras.ops.expand_dims(inference_conditions, axis=1)
+            inference_conditions = keras.ops.broadcast_to(
+                inference_conditions, (batch_size, num_samples, *keras.ops.shape(inference_conditions)[2:])
+            )
+            batch_shape = keras.ops.shape(inference_conditions)[:-1]
+        else:
+            batch_shape = keras.ops.shape(inference_conditions)[1:-1]
+
+        return self.posterior_network.sample(
+            batch_shape, conditions=inference_conditions, **filter_kwargs(kwargs, self.posterior_network.sample)
+        )
