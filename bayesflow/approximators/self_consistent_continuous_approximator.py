@@ -10,7 +10,14 @@ from bayesflow.approximators import Approximator
 from bayesflow.networks.inference_network import InferenceNetwork
 from bayesflow.networks.summary_network import SummaryNetwork
 from bayesflow.distributions.distribution import Distribution
-from bayesflow.utils import filter_kwargs, concatenate_valid_shapes, concatenate_valid, repeat_valid, split_arrays
+from bayesflow.utils import (
+    filter_kwargs,
+    logging,
+    concatenate_valid_shapes,
+    concatenate_valid,
+    repeat_valid,
+    split_arrays,
+)
 from bayesflow.networks.standardization import Standardization
 from bayesflow.utils.serialization import serializable, serialize, deserialize
 
@@ -25,7 +32,7 @@ class SelfConsistentContinuousApproximator(Approximator):
         posterior_network: InferenceNetwork | Distribution,
         summary_network: SummaryNetwork = None,
         standardize: str | Sequence[str] | None = None,
-        num_sc_samples: int = 64,
+        num_sc_samples: int = 16,
         likelihood_summary: bool = True,
         **kwargs,
     ):
@@ -58,10 +65,10 @@ class SelfConsistentContinuousApproximator(Approximator):
                 self.summary_network.build(data_shapes["data"])
             data_summary_shape = self.summary_network.compute_output_shape(data_shapes["data"])
 
-        if isinstance(self.prior_network, InferenceNetwork) and not self.prior_network.built:
+        if not self.prior_network.built:
             self.prior_network.build(data_shapes["parameters"], data_shapes.get("conditions"))
 
-        if isinstance(self.likelihood_network, InferenceNetwork) and not self.likelihood_network.built:
+        if not self.likelihood_network.built:
             likelihood_conditions_shape = concatenate_valid_shapes(
                 (data_shapes["parameters"], data_shapes.get("conditions"))
             )
@@ -70,7 +77,7 @@ class SelfConsistentContinuousApproximator(Approximator):
             else:
                 self.likelihood_network.build(data_shapes["data"], likelihood_conditions_shape)
 
-        if isinstance(self.posterior_network, InferenceNetwork) and not self.posterior_network.built:
+        if not self.posterior_network.built:
             posterior_conditions_shape = concatenate_valid_shapes((data_summary_shape, data_shapes.get("conditions")))
             self.posterior_network.build(data_shapes["parameters"], posterior_conditions_shape)
 
@@ -97,6 +104,7 @@ class SelfConsistentContinuousApproximator(Approximator):
             "prior_network": self.prior_network,
             "likelihood_network": self.likelihood_network,
             "posterior_network": self.posterior_network,
+            "summary_network": self.summary_network,
             "standardize": self.standardize,
             "num_sc_samples": self.num_sc_samples,
             "likelihood_summary": self.likelihood_summary,
@@ -170,20 +178,6 @@ class SelfConsistentContinuousApproximator(Approximator):
 
         return metrics, loss
 
-    def _posterior_metrics(
-        self, parameters: Tensor, data: Tensor, conditions: Tensor, stage: str
-    ) -> tuple[dict, float]:
-        if not isinstance(self.posterior_network, InferenceNetwork):
-            return {}, keras.ops.zeros(())
-
-        metrics = self.posterior_network.compute_metrics(
-            parameters, conditions=concatenate_valid((data, conditions), axis=-1), stage=stage
-        )
-        loss = metrics.get("loss", keras.ops.zeros(()))
-        metrics = {f"{key}/posterior_{key}": value for key, value in metrics.items()}
-
-        return metrics, loss
-
     def _likelihood_metrics(
         self, data: Tensor, parameters: Tensor, conditions: Tensor, stage: str
     ) -> tuple[dict, float]:
@@ -195,6 +189,20 @@ class SelfConsistentContinuousApproximator(Approximator):
         )
         loss = metrics.get("loss", keras.ops.zeros(()))
         metrics = {f"{key}/likelihood_{key}": value for key, value in metrics.items()}
+
+        return metrics, loss
+
+    def _posterior_metrics(
+        self, parameters: Tensor, data: Tensor, conditions: Tensor, stage: str
+    ) -> tuple[dict, float]:
+        if not isinstance(self.posterior_network, InferenceNetwork):
+            return {}, keras.ops.zeros(())
+
+        metrics = self.posterior_network.compute_metrics(
+            parameters, conditions=concatenate_valid((data, conditions), axis=-1), stage=stage
+        )
+        loss = metrics.get("loss", keras.ops.zeros(()))
+        metrics = {f"{key}/posterior_{key}": value for key, value in metrics.items()}
 
         return metrics, loss
 
@@ -223,6 +231,27 @@ class SelfConsistentContinuousApproximator(Approximator):
         metrics = {"loss/self-consistency_loss": loss}
 
         return metrics, loss
+
+    def log_marginal_likelihood(self, num_samples: int, conditions: Mapping[str, np.ndarray], **kwargs) -> np.ndarray:
+        if self.likelihood_summary:
+            logging.warning(
+                "Estimates of the marginal likelihood are biased "
+                "when likelihood density is computed on the summary space!"
+            )
+
+        conditions = self.adapter(conditions, strict=False, stage="inference", **kwargs)
+
+        for key in ["data", "conditions"]:
+            if key in self.standardize and key in conditions:
+                conditions[key] = self.standardize_layers[key](conditions[key])
+
+        conditions = keras.tree.map_structure(keras.ops.convert_to_tensor, conditions)
+        conditions = {k: v for k, v in conditions.items() if k in ["data", "conditions"]}
+
+        log_ml = self._log_marginal_likelihood(num_samples=num_samples, **conditions)
+        log_ml = keras.ops.convert_to_numpy(log_ml)
+
+        return np.mean(log_ml, axis=-1)
 
     def _log_marginal_likelihood(self, num_samples: int, data: Tensor = None, conditions: Tensor = None):
         _, _, data_summary = self._summary_metrics(data, stage="inference")
