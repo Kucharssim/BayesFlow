@@ -59,6 +59,8 @@ class SelfConsistentApproximator(Approximator):
         of the summary network (`True`) or on the raw data (`False`).
         Note that when `True`, the `.log_marginal_likelihood` returns
         biased estimates that are not to be used for model comparison.
+    sc_lambda: keras.optimizers.schedules.LearningRateSchedule | float
+        Scaling of the SC loss. Can depend on the training step based on a custom schedule.
     **kwargs : dict, optional
         Additional arguments passed to the :py:class:`bayesflow.approximators.Approximator` class.
     """
@@ -73,6 +75,7 @@ class SelfConsistentApproximator(Approximator):
         standardize: str | Sequence[str] | None = None,
         num_sc_samples: int = 16,
         likelihood_summary: bool = True,
+        sc_lambda: keras.optimizers.schedules.LearningRateSchedule | float = 1.0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -96,6 +99,8 @@ class SelfConsistentApproximator(Approximator):
             self.standardize_layers = None
         else:
             self.standardize_layers = {var: Standardization(trainable=False) for var in self.standardize}
+
+        self.sc_lambda = sc_lambda
 
     def build(self, data_shapes: dict[str, tuple[int] | dict[str, dict]]) -> None:
         data_summary_shape = None
@@ -127,6 +132,8 @@ class SelfConsistentApproximator(Approximator):
         for var, layer in self.standardize_layers.items():
             layer.build(data_shapes[var])
 
+        self.step = keras.Variable(0, trainable=False)
+
         self.built = True
 
     def build_from_data(self, adapted_data: dict[str, any]):
@@ -147,6 +154,7 @@ class SelfConsistentApproximator(Approximator):
             "standardize": self.standardize,
             "num_sc_samples": self.num_sc_samples,
             "likelihood_summary": self.likelihood_summary,
+            "sc_lambda": self.sc_lambda,
         }
 
         return base_config | serialize(config)
@@ -222,8 +230,10 @@ class SelfConsistentApproximator(Approximator):
         total_loss += loss
 
         # likelihood
+        # gradient of the summary network should not be propagated here
+        # because the summaries are used as 'fixed' input
         metric, loss = self._likelihood_metrics(
-            data_summary if self.likelihood_summary else data, parameters, conditions, stage
+            keras.ops.stop_gradient(data_summary) if self.likelihood_summary else data, parameters, conditions, stage
         )
         metrics = metrics | metric
         total_loss += loss
@@ -231,9 +241,16 @@ class SelfConsistentApproximator(Approximator):
         # self-consistency
         metric, loss = self._self_consistency_metrics(sc_data, sc_conditions)
         metrics = metrics | metric
-        total_loss += loss
+        if isinstance(self.sc_lambda, keras.optimizers.schedules.LearningRateSchedule):
+            total_loss += self.sc_lambda(self.step) * loss
+            metrics = metrics | {"lambda": self.sc_lambda(self.step)}
+        else:
+            total_loss += self.sc_lambda * loss
 
         metrics = {"loss": total_loss} | metrics
+
+        # tick step counter (for sc_lambda schedule)
+        self.step.assign_add(1)
 
         return metrics
 
@@ -366,8 +383,10 @@ class SelfConsistentApproximator(Approximator):
 
         # evaluate prior, likelihood, and posterior
         log_prior = self.prior_network.log_prob(samples=parameters, conditions=conditions)
+        # gradient of the summary network should not be propagated here
+        # because the summaries are used as 'fixed' input
         log_likelihood = self.likelihood_network.log_prob(
-            samples=data_summary if self.likelihood_summary else data,
+            samples=keras.ops.stop_gradient(data_summary) if self.likelihood_summary else data,
             conditions=concatenate_valid((parameters, conditions), axis=-1),
         )
         log_posterior = self.posterior_network.log_prob(samples=parameters, conditions=posterior_conditions)
