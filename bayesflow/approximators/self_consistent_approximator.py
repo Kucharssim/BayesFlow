@@ -4,6 +4,8 @@ import numpy as np
 
 import keras
 
+from keras.optimizers.schedules import LearningRateSchedule  # type: ignore
+
 from bayesflow.types import Tensor
 from bayesflow.adapters import Adapter
 from bayesflow.approximators import Approximator
@@ -59,8 +61,10 @@ class SelfConsistentApproximator(Approximator):
         of the summary network (`True`) or on the raw data (`False`).
         Note that when `True`, the `.log_marginal_likelihood` returns
         biased estimates that are not to be used for model comparison.
-    sc_lambda: keras.optimizers.schedules.LearningRateSchedule | float
-        Scaling of the SC loss. Can depend on the training step based on a custom schedule.
+    loss_schedules: dict[str, float | LearningRateSchedule]
+        Scaling of the training losses. Can depend on the training step based on a custom schedule.
+        The keys of the 4 loss components are:
+        'prior_network', 'likelihood_network', 'posterior_network', 'summary_network', and 'self-consistency'
     **kwargs : dict, optional
         Additional arguments passed to the :py:class:`bayesflow.approximators.Approximator` class.
     """
@@ -75,7 +79,7 @@ class SelfConsistentApproximator(Approximator):
         standardize: str | Sequence[str] | None = None,
         num_sc_samples: int = 16,
         likelihood_summary: bool = True,
-        sc_lambda: keras.optimizers.schedules.LearningRateSchedule | float = 1.0,
+        loss_schedules: dict = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -100,7 +104,9 @@ class SelfConsistentApproximator(Approximator):
         else:
             self.standardize_layers = {var: Standardization(trainable=False) for var in self.standardize}
 
-        self.sc_lambda = sc_lambda
+        if loss_schedules is None:
+            loss_schedules = dict()
+        self.loss_schedules = loss_schedules
 
     def build(self, data_shapes: dict[str, tuple[int] | dict[str, dict]]) -> None:
         data_summary_shape = None
@@ -108,6 +114,9 @@ class SelfConsistentApproximator(Approximator):
             if not self.summary_network.built:
                 self.summary_network.build(data_shapes["data"])
             data_summary_shape = self.summary_network.compute_output_shape(data_shapes["data"])
+
+            if not self.loss_schedules.get("summary_network"):
+                self.loss_schedules["summary_network"] = 1.0
 
         if not self.prior_network.built:
             self.prior_network.build(data_shapes["parameters"], data_shapes.get("conditions"))
@@ -124,6 +133,16 @@ class SelfConsistentApproximator(Approximator):
         if not self.posterior_network.built:
             posterior_conditions_shape = concatenate_valid_shapes((data_summary_shape, data_shapes.get("conditions")))
             self.posterior_network.build(data_shapes["parameters"], posterior_conditions_shape)
+
+        # add fixed schedules if not defined
+        if not self.loss_schedules.get("prior_network"):
+            self.loss_schedules["prior_network"] = 1.0
+        if not self.loss_schedules.get("likelihood_network"):
+            self.loss_schedules["likelihood_network"] = 1.0
+        if not self.loss_schedules.get("posterior_network"):
+            self.loss_schedules["posterior_network"] = 1.0
+        if not self.loss_schedules.get("self-consistency"):
+            self.loss_schedules["self-consistency"] = 1.0
 
         if self.standardize == "all":
             self.standardize = [var for var in ["parameters", "data", "conditions"] if var in data_shapes]
@@ -154,7 +173,7 @@ class SelfConsistentApproximator(Approximator):
             "standardize": self.standardize,
             "num_sc_samples": self.num_sc_samples,
             "likelihood_summary": self.likelihood_summary,
-            "sc_lambda": self.sc_lambda,
+            "loss_schedules": self.loss_schedules,
         }
 
         return base_config | serialize(config)
@@ -241,16 +260,13 @@ class SelfConsistentApproximator(Approximator):
         # self-consistency
         metric, loss = self._self_consistency_metrics(sc_data, sc_conditions)
         metrics = metrics | metric
-        if isinstance(self.sc_lambda, keras.optimizers.schedules.LearningRateSchedule):
-            total_loss += self.sc_lambda(self.step) * loss
-            metrics = metrics | {"lambda": self.sc_lambda(self.step)}
-        else:
-            total_loss += self.sc_lambda * loss
+        total_loss += loss
 
         metrics = {"loss": total_loss} | metrics
 
         # tick step counter (for sc_lambda schedule)
-        self.step.assign_add(1)
+        if stage == "training":
+            self.step.assign_add(1)
 
         return metrics
 
@@ -261,6 +277,15 @@ class SelfConsistentApproximator(Approximator):
         metrics = self.prior_network.compute_metrics(parameters, conditions=conditions, stage=stage)
         loss = metrics.get("loss", keras.ops.zeros(()))
         metrics = {f"{key}/prior_{key}": value for key, value in metrics.items()}
+
+        # weight the loss by schedule
+        if isinstance(self.loss_schedules["prior_network"], LearningRateSchedule):
+            lam = self.loss_schedules["prior_network"](self.step)
+            metrics = metrics | {"lambda/prior": lam}
+        else:
+            lam = self.loss_schedules["prior_network"]
+
+        loss = lam * loss
 
         return metrics, loss
 
@@ -276,6 +301,15 @@ class SelfConsistentApproximator(Approximator):
         loss = metrics.get("loss", keras.ops.zeros(()))
         metrics = {f"{key}/likelihood_{key}": value for key, value in metrics.items()}
 
+        # weight the loss by schedule
+        if isinstance(self.loss_schedules["likelihood_network"], LearningRateSchedule):
+            lam = self.loss_schedules["likelihood_network"](self.step)
+            metrics = metrics | {"lambda/likelihood": lam}
+        else:
+            lam = self.loss_schedules["likelihood_network"]
+
+        loss = lam * loss
+
         return metrics, loss
 
     def _posterior_metrics(
@@ -289,6 +323,15 @@ class SelfConsistentApproximator(Approximator):
         )
         loss = metrics.get("loss", keras.ops.zeros(()))
         metrics = {f"{key}/posterior_{key}": value for key, value in metrics.items()}
+
+        # weight the loss by schedule
+        if isinstance(self.loss_schedules["posterior_network"], LearningRateSchedule):
+            lam = self.loss_schedules["posterior_network"](self.step)
+            metrics = metrics | {"lambda/posterior": lam}
+        else:
+            lam = self.loss_schedules["posterior_network"]
+
+        loss = lam * loss
 
         return metrics, loss
 
@@ -305,6 +348,15 @@ class SelfConsistentApproximator(Approximator):
         loss = metrics.get("loss", keras.ops.zeros(()))
         metrics = {f"{key}/summary_{key}": value for key, value in metrics.items()}
 
+        # weight the loss by schedule
+        if isinstance(self.loss_schedules["summary_network"], LearningRateSchedule):
+            lam = self.loss_schedules["summary_network"](self.step)
+            metrics = metrics | {"lambda/summary": lam}
+        else:
+            lam = self.loss_schedules["summary_network"]
+
+        loss = lam * loss
+
         return metrics, loss, data
 
     def _self_consistency_metrics(self, data: Tensor, conditions: Tensor) -> tuple[dict, float]:
@@ -315,6 +367,15 @@ class SelfConsistentApproximator(Approximator):
         loss = keras.ops.mean(loss)
 
         metrics = {"loss/self-consistency_loss": loss}
+
+        # weight the loss by schedule
+        if isinstance(self.loss_schedules["self-consistency"], LearningRateSchedule):
+            lam = self.loss_schedules["self-consistency"](self.step)
+            metrics = metrics | {"lambda/self-consistency": lam}
+        else:
+            lam = self.loss_schedules["self-consistency"]
+
+        loss = lam * loss
 
         return metrics, loss
 
