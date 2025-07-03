@@ -205,7 +205,7 @@ class SelfConsistentApproximator(Approximator):
         # standardize inputs before doing any computations
         if "parameters" in self.standardize:
             if parameters is not None:
-                parameters = self.standardize_layers["parameters"](data, stage=stage)
+                parameters = self.standardize_layers["parameters"](parameters, stage=stage)
         if "data" in self.standardize:
             if data is not None:
                 data = self.standardize_layers["data"](data, stage=stage)
