@@ -1,34 +1,22 @@
-from collections.abc import Sequence
+from collections.abc import Sequence, Mapping
 
 import keras
-import bayesflow as bf
+from bayesflow.adapters import Adapter
+from bayesflow.approximators import Approximator
 from bayesflow.networks.inference_network import InferenceNetwork
 from bayesflow.networks.summary_network import SummaryNetwork
-from bayesflow.distributions.distribution import Distribution
+from bayesflow.distributions import Distribution, Categorical
 from bayesflow.types import Tensor
 from bayesflow.utils import concatenate_valid_shapes, concatenate_valid, repeat_valid
 from bayesflow.utils.serialization import serializable, serialize, deserialize
 
 
-class PriorModelProbabilities(keras.Layer):
-    def __init__(self, *, prior_weights, **kwargs):
-        super().__init__(**kwargs)
-        self.prior_weights = prior_weights
-        self.prior_probs = [p / sum(prior_weights) for p in prior_weights]
-        self.prior_probs = keras.ops.convert_to_tensor([self.prior_probs])
-
-    def __call__(self, conditions: Tensor, *args, **kwargs):
-        batch_size = keras.ops.shape(conditions)[0]
-
-        return keras.ops.repeat(self.prior_probs, repeats=batch_size, axis=0)
-
-
 @serializable("bayesflow.approximators")
-class SelfConsistentModelComparison(bf.approximators.Approximator):
+class SelfConsistentModelComparison(Approximator):
     def __init__(
         self,
         num_models: int,
-        adapter: bf.Adapter,
+        adapter: Adapter,
         posterior_network: keras.Layer,
         evidence_network: InferenceNetwork | Distribution | Sequence[InferenceNetwork | Distribution],
         prior_network: keras.Layer | Sequence[float] = None,
@@ -44,8 +32,11 @@ class SelfConsistentModelComparison(bf.approximators.Approximator):
         self.posterior_network = posterior_network
         self.evidence_network = evidence_network
 
-        if isinstance(prior_network, Sequence):
-            prior_network = PriorModelProbabilities(prior_weights=prior_network)
+        if prior_network is None:
+            prior_weights = [1.0 for _ in range(num_models)]
+            prior_network = Categorical(prob_weights=prior_weights)
+        elif isinstance(prior_network, Sequence):
+            prior_network = Categorical(prob_weights=prior_network)
         self.prior_network = prior_network
 
         self.summary_network = summary_network
@@ -110,12 +101,12 @@ class SelfConsistentModelComparison(bf.approximators.Approximator):
         self,
         model_indices: Tensor,
         data: Tensor,
-        conditions: Tensor,
-        sc_data: Tensor,
-        sc_conditions: Tensor,
+        conditions: Tensor = None,
+        sc_data: Tensor = None,
+        sc_conditions: Tensor = None,
         stage: str = "training",
     ):
-        metrics, total_loss, data_summary = self._summary_metricsy(data, stage)
+        metrics, total_loss, data_summary = self._summary_metrics(data, stage)
 
         # prior
         metric, loss = self._prior_metrics(model_indices, conditions, stage=stage)
@@ -128,7 +119,7 @@ class SelfConsistentModelComparison(bf.approximators.Approximator):
         total_loss += loss
 
         # likelihood
-        metric, loss = self._evidence_metrics(model_indices, data, data_summary, conditions, stage=stage)
+        metric, loss = self._evidence_metrics(model_indices, data_summary, conditions, stage=stage)
         metrics = metrics | metric
         total_loss += loss
 
@@ -176,7 +167,7 @@ class SelfConsistentModelComparison(bf.approximators.Approximator):
     def _posterior_metrics(
         self, model_indices: Tensor, data: Tensor, conditions: Tensor, stage: str
     ) -> tuple[dict, float]:
-        logits = self.posterior_network(concatenate_valid((data, conditions), axis=-1))
+        logits = self.posterior_network(concatenate_valid((data, conditions), axis=-1), stage=stage)
         loss = keras.losses.categorical_crossentropy(model_indices, logits, from_logits=True)
 
         metrics = {"loss/posterior": loss}
@@ -184,9 +175,21 @@ class SelfConsistentModelComparison(bf.approximators.Approximator):
         return metrics, loss
 
     def _evidence_metrics(
-        self, model_indices: Tensor, data: Tensor, data_summary: Tensor, conditions: Tensor, stage: str
+        self, model_indices: Tensor, data_summary: Tensor, conditions: Tensor, stage: str
     ) -> tuple[dict, float]:
-        pass
+        if isinstance(self.evidence_network, InferenceNetwork):
+            metrics = self.evidence_network.compute_metrics(
+                data_summary, concatenate_valid((model_indices, conditions), axis=-1), stage=stage
+            )
+        elif isinstance(self.evidence_network, Distribution):
+            metrics = {}
+        else:
+            raise NotImplementedError("Sequence of evidence networks is not implemented yet")
+
+        loss = metrics.get("loss", keras.ops.zeros(()))
+        metrics = {f"{key}/evidence_{key}": value for key, value in metrics.items()}
+
+        return metrics, loss
 
     def _self_consistency_metrics(self, data: Tensor, conditions: Tensor) -> tuple[dict, float]:
         log_ml = self._log_marginal_likelihood(data, conditions)
@@ -201,36 +204,57 @@ class SelfConsistentModelComparison(bf.approximators.Approximator):
         _, _, data_summary = self._summary_metrics(data, stage="inference")
         data_summary = keras.ops.stop_gradient(data_summary)
 
-        batch_size = keras.ops.shape(data_summary)[0]
-
-        model_indices = keras.ops.eye(self.num_models)
-        model_indices = repeat_valid(model_indices, batch_size)
-
-        data = repeat_valid(data, self.num_models)
-        data_summary = repeat_valid(data, self.num_models)
-        conditions = repeat_valid(data, self.num_models)
-
         logit_prior = self.prior_network(conditions)
-
         logit_posterior = self.posterior_network(concatenate_valid((data_summary, conditions), axis=-1))
-
-        log_evidences = self._evidences(model_indices, data, data_summary, conditions)
+        log_evidences = self._evidences(data, data_summary, conditions)
 
         log_ml = logit_prior + log_evidences - logit_posterior
-        log_ml = keras.ops.reshape(log_ml, newshape=(batch_size, self.num_models))
 
         return log_ml
 
-    def _evidences(self, model_indices: Tensor, data: Tensor, data_summary: Tensor, conditions: Tensor) -> Tensor:
-        if isinstance(self.evidence_network, InferenceNetwork):
-            pass
-        elif isinstance(self.evidence_network, Distribution):
-            pass
-        elif isinstance(self.evidence_network, Sequence):
-            for net in self.evidence_network:
-                pass
+    def _evidences(self, data: Tensor, data_summary: Tensor, conditions: Tensor) -> Tensor:
+        batch_size = keras.ops.shape(data)[0]
+        model_indices = keras.ops.eye(self.num_models)
+
+        evidence_list = []
+
+        for model_index in range(self.num_models):
+            if isinstance(self.evidence_network, Sequence):
+                net = self.evidence_network[model_index]
+            else:
+                net = self.evidence_network
+
+            model_reps = model_indices[model_index : model_index + 1]  # (1, num_models)
+            model_reps = repeat_valid(model_reps, batch_size)  # (batch_size, num_models)
+
+            evidence = self._evidence(net, model_reps, data, data_summary, conditions)
+            evidence_list.append(evidence)
+
+        evidences = keras.ops.stack(evidence_list, axis=0)
+        evidences = keras.ops.transpose(evidences, [1, 0])
+
+        return evidences
+
+    def _evidence(
+        self,
+        evidence_network: keras.Layer,
+        model_indices: Tensor,
+        data: Tensor,
+        data_summary: Tensor,
+        conditions: Tensor,
+    ):
+        if isinstance(evidence_network, InferenceNetwork):
+            return evidence_network.log_prob(data_summary, concatenate_valid((model_indices, conditions), axis=-1))
+        elif isinstance(evidence_network, Distribution):
+            return evidence_network.log_prob(data, model_indices, conditions)
         else:
             raise ValueError(
-                "evidence network must be an inference network, a distribution, "
-                "or a sequence of inference networks or distributions."
+                "evidence network must be an instance of Inference network or an instance of a Distribution"
             )
+
+    def _batch_size_from_data(self, data: Mapping[str, any]) -> int:
+        """
+        Fetches the current batch size from an input dictionary. Can only be used during training when
+        model indices as present.
+        """
+        return keras.ops.shape(data["model_indices"])[0]

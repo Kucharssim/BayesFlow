@@ -8,6 +8,7 @@ from .distribution import Distribution
 from .diagonal_normal import DiagonalNormal
 from .diagonal_student_t import DiagonalStudentT
 from .mixture import Mixture
+from .categorical import Categorical
 
 from ..utils._docs import _add_imports_to_all
 
