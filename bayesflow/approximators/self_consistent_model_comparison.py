@@ -1,6 +1,10 @@
 from collections.abc import Sequence, Mapping
 
 import keras
+import numpy as np
+
+from keras.optimizers.schedules import LearningRateSchedule  # type: ignore
+
 from bayesflow.adapters import Adapter
 from bayesflow.approximators import Approximator
 from bayesflow.networks.inference_network import InferenceNetwork
@@ -52,6 +56,9 @@ class SelfConsistentModelComparison(Approximator):
                 self.summary_network.build(data_shapes["data"])
             summary_outputs_shape = self.summary_network.compute_output_shape(data_shapes["data"])
 
+            if not self.loss_schedules.get("summary_network"):
+                self.loss_schedules["summary_network"] = 1.0
+
         posterior_network_conditions_shape = concatenate_valid_shapes(
             [summary_outputs_shape, data_shapes.get("conditions")], axis=-1
         )
@@ -72,6 +79,18 @@ class SelfConsistentModelComparison(Approximator):
         else:
             if not self.evidence_network.built:
                 self.evidence_network.build(summary_outputs_shape, evidence_network_conditions_shape)
+
+        # add fixed schedules if not defined
+        if not self.loss_schedules.get("prior_network"):
+            self.loss_schedules["prior_network"] = 1.0
+        if not self.loss_schedules.get("evidence_network"):
+            self.loss_schedules["evidence_network"] = 1.0
+        if not self.loss_schedules.get("posterior_network"):
+            self.loss_schedules["posterior_network"] = 1.0
+        if not self.loss_schedules.get("self-consistency"):
+            self.loss_schedules["self-consistency"] = 1.0
+
+        self.step = keras.Variable(0, trainable=False)
 
         self.built = True
 
@@ -130,6 +149,10 @@ class SelfConsistentModelComparison(Approximator):
 
         metrics = {"loss": total_loss} | metrics
 
+        # tick step counter (for sc_lambda schedule)
+        if stage == "training":
+            self.step.assign_add(1)
+
         return metrics
 
     def _summary_metrics(self, data: Tensor, stage: str) -> tuple[dict, float, Tensor]:
@@ -146,31 +169,56 @@ class SelfConsistentModelComparison(Approximator):
         metrics = {f"{key}/summary_{key}": value for key, value in metrics.items()}
 
         # weight the loss by schedule
-        # if isinstance(self.loss_schedules["summary_network"], LearningRateSchedule):
-        #     lam = self.loss_schedules["summary_network"](self.step)
-        #     metrics = metrics | {"lambda/summary": lam}
-        # else:
-        #     lam = self.loss_schedules["summary_network"]
+        if isinstance(self.loss_schedules["summary_network"], LearningRateSchedule):
+            lam = self.loss_schedules["summary_network"](self.step)
+            metrics = metrics | {"lambda/summary": lam}
+        else:
+            lam = self.loss_schedules["summary_network"]
 
-        # loss = lam * loss
+        loss = lam * loss
 
         return metrics, loss, data
 
     def _prior_metrics(self, model_indices: Tensor, conditions: Tensor, stage: str) -> tuple[dict, float]:
-        logits = self.prior_network(conditions, stage=stage)
+        if isinstance(self.prior_network, Distribution):
+            return {}, keras.ops.zeros(())
+        logits = self.prior_network(conditions, training=stage == "training")
+
+        # in case conditions are None, the prior_network might not know how to return output with batch_size shape
+        if keras.ops.shape(logits)[0] == 1:
+            logits = repeat_valid(logits, keras.ops.shape(model_indices)[0])
         loss = keras.losses.categorical_crossentropy(model_indices, logits, from_logits=True)
 
         metrics = {"loss/prior": loss}
+
+        if isinstance(self.loss_schedules["prior_network"], LearningRateSchedule):
+            lam = self.loss_schedules["prior_network"](self.step)
+            metrics = metrics | {"lambda/prior": lam}
+        else:
+            lam = self.loss_schedules["prior_network"]
+
+        loss = lam * loss
 
         return metrics, loss
 
     def _posterior_metrics(
         self, model_indices: Tensor, data: Tensor, conditions: Tensor, stage: str
     ) -> tuple[dict, float]:
-        logits = self.posterior_network(concatenate_valid((data, conditions), axis=-1), stage=stage)
+        if isinstance(self.posterior_network, Distribution):
+            return {}, keras.ops.zeros(())
+
+        logits = self.posterior_network(concatenate_valid((data, conditions), axis=-1), training=stage == "training")
         loss = keras.losses.categorical_crossentropy(model_indices, logits, from_logits=True)
 
         metrics = {"loss/posterior": loss}
+
+        if isinstance(self.loss_schedules["posterior_network"], LearningRateSchedule):
+            lam = self.loss_schedules["posterior_network"](self.step)
+            metrics = metrics | {"lambda/posterior": lam}
+        else:
+            lam = self.loss_schedules["posterior_network"]
+
+        loss = lam * loss
 
         return metrics, loss
 
@@ -181,13 +229,57 @@ class SelfConsistentModelComparison(Approximator):
             metrics = self.evidence_network.compute_metrics(
                 data_summary, concatenate_valid((model_indices, conditions), axis=-1), stage=stage
             )
+            loss = metrics.get("loss", keras.ops.zeros(()))
+            metrics = {f"{key}/evidence_{key}": value for key, value in metrics.items()}
         elif isinstance(self.evidence_network, Distribution):
             metrics = {}
-        else:
-            raise NotImplementedError("Sequence of evidence networks is not implemented yet")
+            loss = keras.ops.zeros(())
+        elif isinstance(self.evidence_network, Sequence):
+            metrics = {}
+            loss = keras.ops.zeros(())
 
-        loss = metrics.get("loss", keras.ops.zeros(()))
-        metrics = {f"{key}/evidence_{key}": value for key, value in metrics.items()}
+            for model_id in range(self.num_models):
+                # Select rows where model_id is active (model_indices[:, model_id] == 1)
+                mask = keras.ops.equal(model_indices[:, model_id], 1.0)
+                mask = keras.ops.cast(mask, "bool")
+
+                # Get indices for current model
+                indices = keras.ops.where(mask)[0]
+
+                # Gather matching rows
+                subset_model_indices = keras.ops.take(model_indices, indices, axis=0)
+                subset_data_summary = keras.ops.take(data_summary, indices, axis=0)
+                if conditions:
+                    subset_conditions = keras.ops.take(conditions, indices, axis=0)
+                else:
+                    subset_conditions = None
+
+                print(keras.ops.ndim(model_indices))
+                print(keras.ops.ndim(subset_model_indices))
+
+                # Compute metrics for this model's evidence network
+                evidence_network = self.evidence_network[model_id]
+
+                if isinstance(evidence_network, InferenceNetwork):
+                    sub_metrics = evidence_network.compute_metrics(
+                        subset_data_summary,
+                        concatenate_valid((subset_model_indices, subset_conditions), axis=-1),
+                        stage=stage,
+                    )
+                    loss += sub_metrics.get("loss", keras.ops.zeros(()))
+                else:
+                    sub_metrics = {}
+
+                for key, value in sub_metrics.items():
+                    metrics[f"{key}/evidence_{key}/model_{model_id}"] = value
+
+        if isinstance(self.loss_schedules["evidence_network"], LearningRateSchedule):
+            lam = self.loss_schedules["evidence_network"](self.step)
+            metrics = metrics | {"lambda/evidence": lam}
+        else:
+            lam = self.loss_schedules["evidence_network"]
+
+        loss = lam * loss
 
         return metrics, loss
 
@@ -197,6 +289,15 @@ class SelfConsistentModelComparison(Approximator):
         loss = keras.ops.mean(loss)
 
         metrics = {"loss/self-consistency_loss": loss}
+
+        # weight the loss by schedule
+        if isinstance(self.loss_schedules["self-consistency"], LearningRateSchedule):
+            lam = self.loss_schedules["self-consistency"](self.step)
+            metrics = metrics | {"lambda/self-consistency": lam}
+        else:
+            lam = self.loss_schedules["self-consistency"]
+
+        loss = lam * loss
 
         return metrics, loss
 
@@ -258,3 +359,48 @@ class SelfConsistentModelComparison(Approximator):
         model indices as present.
         """
         return keras.ops.shape(data["model_indices"])[0]
+
+    def predict(
+        self,
+        *,
+        conditions: Mapping[str, np.ndarray],
+        probs: bool = True,
+        **kwargs,
+    ) -> np.ndarray:
+        """
+        Predicts posterior model probabilities given input conditions. The `conditions` dictionary is preprocessed
+        using the `adapter`. The output is converted to NumPy array after inference.
+
+        Parameters
+        ----------
+        conditions : Mapping[str, np.ndarray]
+            Dictionary of conditioning variables as NumPy arrays.
+        probs: bool, optional
+            A flag indicating whether model probabilities (True) or logits (False) are returned. Default is True.
+        **kwargs : dict
+            Additional keyword arguments for the adapter and classifier.
+
+        Returns
+        -------
+        outputs: np.ndarray
+            Predicted posterior model probabilities given `conditions`.
+        """
+
+        # Apply adapter transforms to raw simulated / real quantities
+        conditions = self.adapter(conditions, strict=False, **kwargs)
+        conditions = keras.tree.map_structure(keras.ops.convert_to_tensor, conditions)
+
+        output = self._predict(**conditions, **kwargs)
+
+        if probs:
+            output = keras.ops.softmax(output)
+
+        return keras.ops.convert_to_numpy(output)
+
+    def _predict(self, data, conditions, **kwargs) -> Tensor:
+        if self.summary_network:
+            data = self.summary_network(data, stage="inference")
+
+        logits = self.posterior_network(concatenate_valid((data, conditions), axis=-1), training=False)
+
+        return logits

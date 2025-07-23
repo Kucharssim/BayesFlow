@@ -35,6 +35,4 @@ class Categorical(Distribution):
         return keras.ops.log(prob)
 
     def __call__(self, conditions: Tensor, *args, **kwargs):
-        batch_size = keras.ops.shape(conditions)[0]
-
-        return keras.ops.repeat(self.probs, repeats=batch_size, axis=0)
+        return self.probs
