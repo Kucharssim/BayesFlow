@@ -25,6 +25,7 @@ class SelfConsistentModelComparison(Approximator):
         evidence_network: InferenceNetwork | Distribution | Sequence[InferenceNetwork | Distribution],
         prior_network: keras.Layer | Sequence[float] = None,
         summary_network: SummaryNetwork = None,
+        compute_sc: bool = True,
         loss_schedules: dict = None,
         **kwargs,
     ):
@@ -44,6 +45,8 @@ class SelfConsistentModelComparison(Approximator):
         self.prior_network = prior_network
 
         self.summary_network = summary_network
+
+        self.compute_sc = compute_sc
 
         if loss_schedules is None:
             loss_schedules = dict()
@@ -111,6 +114,7 @@ class SelfConsistentModelComparison(Approximator):
             "evidence_network": self.evidence_network,
             "prior_network": self.prior_network,
             "summary_network": self.summary_network,
+            "compute_sc": self.compute_sc,
             "loss_schedules": self.loss_schedules,
         }
 
@@ -143,9 +147,10 @@ class SelfConsistentModelComparison(Approximator):
         total_loss += loss
 
         # self-consistency
-        metric, loss = self._self_consistency_metrics(sc_data, sc_conditions)
-        metrics = metrics | metric
-        total_loss += loss
+        if self.compute_sc:
+            metric, loss = self._self_consistency_metrics(sc_data, sc_conditions)
+            metrics = metrics | metric
+            total_loss += loss
 
         metrics = {"loss": total_loss} | metrics
 
@@ -157,13 +162,13 @@ class SelfConsistentModelComparison(Approximator):
 
     def _summary_metrics(self, data: Tensor, stage: str) -> tuple[dict, float, Tensor]:
         if self.summary_network is None:
-            metrics = {}
-        else:
-            if data is None:
-                raise ValueError("Sumary variables are required when summary network is present.")
+            return {}, keras.ops.zeros(()), data
 
-            metrics = self.summary_network.compute_metrics(data, stage=stage)
-            data = metrics.pop("outputs")
+        if data is None:
+            raise ValueError("Sumary variables are required when summary network is present.")
+
+        metrics = self.summary_network.compute_metrics(data, stage=stage)
+        data = metrics.pop("outputs")
 
         loss = metrics.get("loss", keras.ops.zeros(()))
         metrics = {f"{key}/summary_{key}": value for key, value in metrics.items()}
@@ -253,9 +258,6 @@ class SelfConsistentModelComparison(Approximator):
                     subset_conditions = keras.ops.take(conditions, indices, axis=0)
                 else:
                     subset_conditions = None
-
-                print(keras.ops.ndim(model_indices))
-                print(keras.ops.ndim(subset_model_indices))
 
                 # Compute metrics for this model's evidence network
                 evidence_network = self.evidence_network[model_id]
@@ -397,7 +399,7 @@ class SelfConsistentModelComparison(Approximator):
 
         return keras.ops.convert_to_numpy(output)
 
-    def _predict(self, data, conditions, **kwargs) -> Tensor:
+    def _predict(self, data, conditions=None, **kwargs) -> Tensor:
         if self.summary_network:
             data = self.summary_network(data, stage="inference")
 
