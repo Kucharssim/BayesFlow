@@ -115,7 +115,7 @@ class SelfConsistentApproximator(Approximator):
                 self.summary_network.build(data_shapes["data"])
             data_summary_shape = self.summary_network.compute_output_shape(data_shapes["data"])
 
-            if not self.loss_schedules.get("summary_network"):
+            if self.loss_schedules.get("summary_network") is None:
                 self.loss_schedules["summary_network"] = 1.0
 
         if not self.prior_network.built:
@@ -135,13 +135,13 @@ class SelfConsistentApproximator(Approximator):
             self.posterior_network.build(data_shapes["parameters"], posterior_conditions_shape)
 
         # add fixed schedules if not defined
-        if not self.loss_schedules.get("prior_network"):
+        if self.loss_schedules.get("prior_network") is None:
             self.loss_schedules["prior_network"] = 1.0
-        if not self.loss_schedules.get("likelihood_network"):
+        if self.loss_schedules.get("likelihood_network") is None:
             self.loss_schedules["likelihood_network"] = 1.0
-        if not self.loss_schedules.get("posterior_network"):
+        if self.loss_schedules.get("posterior_network") is None:
             self.loss_schedules["posterior_network"] = 1.0
-        if not self.loss_schedules.get("self-consistency"):
+        if self.loss_schedules.get("self-consistency") is None:
             self.loss_schedules["self-consistency"] = 1.0
 
         if self.standardize == "all":

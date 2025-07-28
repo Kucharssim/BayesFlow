@@ -22,10 +22,11 @@ class SelfConsistentModelComparison(Approximator):
         num_models: int,
         adapter: Adapter,
         posterior_network: keras.Layer,
-        evidence_network: InferenceNetwork | Distribution | Sequence[InferenceNetwork | Distribution],
+        evidence_network: InferenceNetwork | Distribution,
         prior_network: keras.Layer | Sequence[float] = None,
         summary_network: SummaryNetwork = None,
         compute_sc: bool = True,
+        evidence_summary: bool = True,
         loss_schedules: dict = None,
         **kwargs,
     ):
@@ -47,6 +48,7 @@ class SelfConsistentModelComparison(Approximator):
         self.summary_network = summary_network
 
         self.compute_sc = compute_sc
+        self.evidence_summary = evidence_summary
 
         if loss_schedules is None:
             loss_schedules = dict()
@@ -59,7 +61,7 @@ class SelfConsistentModelComparison(Approximator):
                 self.summary_network.build(data_shapes["data"])
             summary_outputs_shape = self.summary_network.compute_output_shape(data_shapes["data"])
 
-            if not self.loss_schedules.get("summary_network"):
+            if self.loss_schedules.get("summary_network") is None:
                 self.loss_schedules["summary_network"] = 1.0
 
         posterior_network_conditions_shape = concatenate_valid_shapes(
@@ -75,22 +77,20 @@ class SelfConsistentModelComparison(Approximator):
         evidence_network_conditions_shape = concatenate_valid_shapes(
             [data_shapes.get("model_indices"), data_shapes.get("conditions")], axis=-1
         )
-        if isinstance(self.evidence_network, Sequence):
-            for net in self.evidence_network:
-                if not net.built:
-                    net.build(summary_outputs_shape, evidence_network_conditions_shape)
-        else:
-            if not self.evidence_network.built:
+        if not self.evidence_network.built:
+            if self.evidence_summary:
                 self.evidence_network.build(summary_outputs_shape, evidence_network_conditions_shape)
+            else:
+                self.evidence_network.build(data_shapes.get("data"), evidence_network_conditions_shape)
 
         # add fixed schedules if not defined
-        if not self.loss_schedules.get("prior_network"):
+        if self.loss_schedules.get("prior_network") is None:
             self.loss_schedules["prior_network"] = 1.0
-        if not self.loss_schedules.get("evidence_network"):
+        if self.loss_schedules.get("evidence_network") is None:
             self.loss_schedules["evidence_network"] = 1.0
-        if not self.loss_schedules.get("posterior_network"):
+        if self.loss_schedules.get("posterior_network") is None:
             self.loss_schedules["posterior_network"] = 1.0
-        if not self.loss_schedules.get("self-consistency"):
+        if self.loss_schedules.get("self-consistency") is None:
             self.loss_schedules["self-consistency"] = 1.0
 
         self.step = keras.Variable(0, trainable=False)
@@ -142,7 +142,12 @@ class SelfConsistentModelComparison(Approximator):
         total_loss += loss
 
         # likelihood
-        metric, loss = self._evidence_metrics(model_indices, data_summary, conditions, stage=stage)
+        metric, loss = self._evidence_metrics(
+            model_indices,
+            keras.ops.stop_gradient(data_summary) if self.evidence_summary else data,
+            conditions,
+            stage=stage,
+        )
         metrics = metrics | metric
         total_loss += loss
 
@@ -228,52 +233,17 @@ class SelfConsistentModelComparison(Approximator):
         return metrics, loss
 
     def _evidence_metrics(
-        self, model_indices: Tensor, data_summary: Tensor, conditions: Tensor, stage: str
+        self, model_indices: Tensor, data: Tensor, conditions: Tensor, stage: str
     ) -> tuple[dict, float]:
         if isinstance(self.evidence_network, InferenceNetwork):
             metrics = self.evidence_network.compute_metrics(
-                data_summary, concatenate_valid((model_indices, conditions), axis=-1), stage=stage
+                data, concatenate_valid((model_indices, conditions), axis=-1), stage=stage
             )
             loss = metrics.get("loss", keras.ops.zeros(()))
             metrics = {f"{key}/evidence_{key}": value for key, value in metrics.items()}
         elif isinstance(self.evidence_network, Distribution):
             metrics = {}
             loss = keras.ops.zeros(())
-        elif isinstance(self.evidence_network, Sequence):
-            metrics = {}
-            loss = keras.ops.zeros(())
-
-            for model_id in range(self.num_models):
-                # Select rows where model_id is active (model_indices[:, model_id] == 1)
-                mask = keras.ops.equal(model_indices[:, model_id], 1.0)
-                mask = keras.ops.cast(mask, "bool")
-
-                # Get indices for current model
-                indices = keras.ops.where(mask)[0]
-
-                # Gather matching rows
-                subset_model_indices = keras.ops.take(model_indices, indices, axis=0)
-                subset_data_summary = keras.ops.take(data_summary, indices, axis=0)
-                if conditions:
-                    subset_conditions = keras.ops.take(conditions, indices, axis=0)
-                else:
-                    subset_conditions = None
-
-                # Compute metrics for this model's evidence network
-                evidence_network = self.evidence_network[model_id]
-
-                if isinstance(evidence_network, InferenceNetwork):
-                    sub_metrics = evidence_network.compute_metrics(
-                        subset_data_summary,
-                        concatenate_valid((subset_model_indices, subset_conditions), axis=-1),
-                        stage=stage,
-                    )
-                    loss += sub_metrics.get("loss", keras.ops.zeros(()))
-                else:
-                    sub_metrics = {}
-
-                for key, value in sub_metrics.items():
-                    metrics[f"{key}/evidence_{key}/model_{model_id}"] = value
 
         if isinstance(self.loss_schedules["evidence_network"], LearningRateSchedule):
             lam = self.loss_schedules["evidence_network"](self.step)
@@ -309,51 +279,38 @@ class SelfConsistentModelComparison(Approximator):
 
         logit_prior = self.prior_network(conditions)
         logit_posterior = self.posterior_network(concatenate_valid((data_summary, conditions), axis=-1))
-        log_evidences = self._evidences(data, data_summary, conditions)
+        log_evidences = self._evidences(data_summary if self.evidence_summary else data, conditions)
 
         log_ml = logit_prior + log_evidences - logit_posterior
 
         return log_ml
 
-    def _evidences(self, data: Tensor, data_summary: Tensor, conditions: Tensor) -> Tensor:
+    def _evidences(self, data: Tensor, conditions: Tensor) -> Tensor:
+        # for each data set, calculate evidence for each model
         batch_size = keras.ops.shape(data)[0]
         model_indices = keras.ops.eye(self.num_models)
 
         evidence_list = []
 
         for model_index in range(self.num_models):
-            if isinstance(self.evidence_network, Sequence):
-                net = self.evidence_network[model_index]
-            else:
-                net = self.evidence_network
-
             model_reps = model_indices[model_index : model_index + 1]  # (1, num_models)
             model_reps = repeat_valid(model_reps, batch_size)  # (batch_size, num_models)
 
-            evidence = self._evidence(net, model_reps, data, data_summary, conditions)
+            if isinstance(self.evidence_network, InferenceNetwork):
+                evidence = self.evidence_network.log_prob(data, concatenate_valid((model_reps, conditions), axis=-1))
+            elif isinstance(self.evidence_network, Distribution):
+                evidence = self.evidence_network.log_prob(data, model_reps, conditions)
+            else:
+                raise ValueError(
+                    "evidence network must be an instance of Inference network or an instance of a Distribution"
+                )
+
             evidence_list.append(evidence)
 
         evidences = keras.ops.stack(evidence_list, axis=0)
         evidences = keras.ops.transpose(evidences, [1, 0])
 
         return evidences
-
-    def _evidence(
-        self,
-        evidence_network: keras.Layer,
-        model_indices: Tensor,
-        data: Tensor,
-        data_summary: Tensor,
-        conditions: Tensor,
-    ):
-        if isinstance(evidence_network, InferenceNetwork):
-            return evidence_network.log_prob(data_summary, concatenate_valid((model_indices, conditions), axis=-1))
-        elif isinstance(evidence_network, Distribution):
-            return evidence_network.log_prob(data, model_indices, conditions)
-        else:
-            raise ValueError(
-                "evidence network must be an instance of Inference network or an instance of a Distribution"
-            )
 
     def _batch_size_from_data(self, data: Mapping[str, any]) -> int:
         """
