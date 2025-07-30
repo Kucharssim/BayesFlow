@@ -78,7 +78,7 @@ class SelfConsistentApproximator(Approximator):
         summary_network: SummaryNetwork = None,
         standardize: str | Sequence[str] | None = None,
         num_sc_samples: int = 16,
-        likelihood_summary: bool = True,
+        likelihood_summary: bool = False,
         loss_schedules: dict = None,
         **kwargs,
     ):
@@ -109,7 +109,7 @@ class SelfConsistentApproximator(Approximator):
         self.loss_schedules = loss_schedules
 
     def build(self, data_shapes: dict[str, tuple[int] | dict[str, dict]]) -> None:
-        data_summary_shape = None
+        data_summary_shape = data_shapes["data"]
         if self.summary_network is not None:
             if not self.summary_network.built:
                 self.summary_network.build(data_shapes["data"])
@@ -321,6 +321,7 @@ class SelfConsistentApproximator(Approximator):
         metrics = self.posterior_network.compute_metrics(
             parameters, conditions=concatenate_valid((data, conditions), axis=-1), stage=stage
         )
+
         loss = metrics.get("loss", keras.ops.zeros(()))
         metrics = {f"{key}/posterior_{key}": value for key, value in metrics.items()}
 
@@ -337,13 +338,13 @@ class SelfConsistentApproximator(Approximator):
 
     def _summary_metrics(self, data: Tensor, stage: str) -> tuple[dict, float, Tensor]:
         if self.summary_network is None:
-            metrics = {}
-        else:
-            if data is None:
-                raise ValueError("Sumary variables are required when summary network is present.")
+            return {}, keras.ops.zeros(()), data
 
-            metrics = self.summary_network.compute_metrics(data, stage=stage)
-            data = metrics.pop("outputs")
+        if data is None:
+            raise ValueError("Sumary variables are required when summary network is present.")
+
+        metrics = self.summary_network.compute_metrics(data, stage=stage)
+        data = metrics.pop("outputs")
 
         loss = metrics.get("loss", keras.ops.zeros(()))
         metrics = {f"{key}/summary_{key}": value for key, value in metrics.items()}

@@ -9,7 +9,7 @@ from bayesflow.adapters import Adapter
 from bayesflow.approximators import Approximator
 from bayesflow.networks.inference_network import InferenceNetwork
 from bayesflow.networks.summary_network import SummaryNetwork
-from bayesflow.distributions import Distribution, Categorical
+from bayesflow.distributions import Distribution
 from bayesflow.types import Tensor
 from bayesflow.utils import concatenate_valid_shapes, concatenate_valid, repeat_valid
 from bayesflow.utils.serialization import serializable, serialize, deserialize
@@ -23,10 +23,10 @@ class SelfConsistentModelComparison(Approximator):
         adapter: Adapter,
         posterior_network: keras.Layer,
         evidence_network: InferenceNetwork | Distribution,
-        prior_network: keras.Layer | Sequence[float] = None,
+        prior_weights: Sequence[float] = None,
         summary_network: SummaryNetwork = None,
         compute_sc: bool = True,
-        evidence_summary: bool = True,
+        evidence_summary: bool = False,
         loss_schedules: dict = None,
         **kwargs,
     ):
@@ -38,12 +38,13 @@ class SelfConsistentModelComparison(Approximator):
         self.posterior_network = posterior_network
         self.evidence_network = evidence_network
 
-        if prior_network is None:
-            prior_weights = [1.0 for _ in range(num_models)]
-            prior_network = Categorical(prob_weights=prior_weights)
-        elif isinstance(prior_network, Sequence):
-            prior_network = Categorical(prob_weights=prior_network)
-        self.prior_network = prior_network
+        if prior_weights is None:
+            prior_weights = [-np.log(num_models) for _ in range(num_models)]
+
+        if len(prior_weights) != num_models:
+            raise ValueError("There must be exactly one prior weight for every model")
+
+        self.log_prior = keras.ops.convert_to_tensor([prior_weights])
 
         self.summary_network = summary_network
 
@@ -71,9 +72,6 @@ class SelfConsistentModelComparison(Approximator):
         if not self.posterior_network.built:
             self.posterior_network.build(posterior_network_conditions_shape)
 
-        if not self.prior_network.built:
-            self.prior_network.build(data_shapes.get("conditions"))
-
         evidence_network_conditions_shape = concatenate_valid_shapes(
             [data_shapes.get("model_indices"), data_shapes.get("conditions")], axis=-1
         )
@@ -84,8 +82,6 @@ class SelfConsistentModelComparison(Approximator):
                 self.evidence_network.build(data_shapes.get("data"), evidence_network_conditions_shape)
 
         # add fixed schedules if not defined
-        if self.loss_schedules.get("prior_network") is None:
-            self.loss_schedules["prior_network"] = 1.0
         if self.loss_schedules.get("evidence_network") is None:
             self.loss_schedules["evidence_network"] = 1.0
         if self.loss_schedules.get("posterior_network") is None:
@@ -112,7 +108,7 @@ class SelfConsistentModelComparison(Approximator):
             "adapter": self.adapter,
             "posterior_network": self.posterior_network,
             "evidence_network": self.evidence_network,
-            "prior_network": self.prior_network,
+            "log_prior": self.log_prior,
             "summary_network": self.summary_network,
             "compute_sc": self.compute_sc,
             "loss_schedules": self.loss_schedules,
@@ -130,11 +126,6 @@ class SelfConsistentModelComparison(Approximator):
         stage: str = "training",
     ):
         metrics, total_loss, data_summary = self._summary_metrics(data, stage)
-
-        # prior
-        metric, loss = self._prior_metrics(model_indices, conditions, stage=stage)
-        metrics = metrics | metric
-        total_loss += loss
 
         # posterior
         metric, loss = self._posterior_metrics(model_indices, data_summary, conditions, stage=stage)
@@ -189,28 +180,6 @@ class SelfConsistentModelComparison(Approximator):
 
         return metrics, loss, data
 
-    def _prior_metrics(self, model_indices: Tensor, conditions: Tensor, stage: str) -> tuple[dict, float]:
-        if isinstance(self.prior_network, Distribution):
-            return {}, keras.ops.zeros(())
-        logits = self.prior_network(conditions, training=stage == "training")
-
-        # in case conditions are None, the prior_network might not know how to return output with batch_size shape
-        if keras.ops.shape(logits)[0] == 1:
-            logits = repeat_valid(logits, keras.ops.shape(model_indices)[0])
-        loss = keras.losses.categorical_crossentropy(model_indices, logits, from_logits=True)
-
-        metrics = {"loss/prior": loss}
-
-        if isinstance(self.loss_schedules["prior_network"], LearningRateSchedule):
-            lam = self.loss_schedules["prior_network"](self.step)
-            metrics = metrics | {"lambda/prior": lam}
-        else:
-            lam = self.loss_schedules["prior_network"]
-
-        loss = lam * loss
-
-        return metrics, loss
-
     def _posterior_metrics(
         self, model_indices: Tensor, data: Tensor, conditions: Tensor, stage: str
     ) -> tuple[dict, float]:
@@ -220,7 +189,7 @@ class SelfConsistentModelComparison(Approximator):
         logits = self.posterior_network(concatenate_valid((data, conditions), axis=-1), training=stage == "training")
         loss = keras.losses.categorical_crossentropy(model_indices, logits, from_logits=True)
 
-        metrics = {"loss/posterior": loss}
+        metrics = {"loss/posterior_loss": loss}
 
         if isinstance(self.loss_schedules["posterior_network"], LearningRateSchedule):
             lam = self.loss_schedules["posterior_network"](self.step)
@@ -277,11 +246,11 @@ class SelfConsistentModelComparison(Approximator):
         _, _, data_summary = self._summary_metrics(data, stage="inference")
         data_summary = keras.ops.stop_gradient(data_summary)
 
-        logit_prior = self.prior_network(conditions)
         logit_posterior = self.posterior_network(concatenate_valid((data_summary, conditions), axis=-1))
         log_evidences = self._evidences(data_summary if self.evidence_summary else data, conditions)
+        log_prior = keras.ops.cast(self.log_prior, dtype=keras.ops.dtype(logit_posterior))
 
-        log_ml = logit_prior + log_evidences - logit_posterior
+        log_ml = log_prior + log_evidences - logit_posterior
 
         return log_ml
 
@@ -363,3 +332,48 @@ class SelfConsistentModelComparison(Approximator):
         logits = self.posterior_network(concatenate_valid((data, conditions), axis=-1), training=False)
 
         return logits
+
+    def bayes_factors(
+        self,
+        *,
+        conditions: Mapping[str, np.ndarray],
+        log: bool = True,
+        **kwargs,
+    ) -> np.ndarray:
+        """
+        Predicts pairwise Bayes factors given input conditions. The `conditions` dictionary is preprocessed
+        using the `adapter`. The output is converted to NumPy array after inference.
+
+        Parameters
+        ----------
+        conditions : Mapping[str, np.ndarray]
+            Dictionary of conditioning variables as NumPy arrays.
+        probs: bool, optional
+            A flag indicating whether model probabilities (True) or logits (False) are returned. Default is True.
+        **kwargs : dict
+            Additional keyword arguments for the adapter and classifier.
+
+        Returns
+        -------
+        outputs: np.ndarray
+            Predicted Bayes factors given `conditions`.
+        """
+
+        logit_posterior = self.predict(conditions=conditions, probs=False, **kwargs)
+        log_prior = keras.ops.cast(self.log_prior, dtype=keras.ops.dtype(logit_posterior))
+
+        evidences = logit_posterior - log_prior
+        evidences = keras.ops.convert_to_numpy(evidences)
+
+        log_bf = np.zeros((logit_posterior.shape[0], self.num_models, self.num_models))
+
+        for evidence_for in range(self.num_models):
+            for evidence_against in range(self.num_models):
+                log_bf[:, evidence_for, evidence_against] = (
+                    evidences[..., evidence_for] - evidences[..., evidence_against]
+                )
+
+        if log:
+            return log_bf
+
+        return np.exp(log_bf)
