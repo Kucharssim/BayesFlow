@@ -109,6 +109,7 @@ from . import (
     experimental,
     networks,
     simulators,
+    schedules,
     utils,
     workflows,
     wrappers,

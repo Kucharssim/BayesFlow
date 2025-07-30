@@ -358,7 +358,7 @@ class SelfConsistentModelComparison(Approximator):
 
     def _predict(self, data, conditions=None, **kwargs) -> Tensor:
         if self.summary_network:
-            data = self.summary_network(data, stage="inference")
+            data = self.summary_network(data)
 
         logits = self.posterior_network(concatenate_valid((data, conditions), axis=-1), training=False)
 
