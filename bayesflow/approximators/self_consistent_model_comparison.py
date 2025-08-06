@@ -44,6 +44,8 @@ class SelfConsistentModelComparison(Approximator):
         if len(prior_weights) != num_models:
             raise ValueError("There must be exactly one prior weight for every model")
 
+        self.prior_weights = prior_weights
+
         self.log_prior = keras.ops.convert_to_tensor([prior_weights])
 
         self.summary_network = summary_network
@@ -108,7 +110,7 @@ class SelfConsistentModelComparison(Approximator):
             "adapter": self.adapter,
             "posterior_network": self.posterior_network,
             "evidence_network": self.evidence_network,
-            "log_prior": self.log_prior,
+            "prior_weights": self.prior_weights,
             "summary_network": self.summary_network,
             "compute_sc": self.compute_sc,
             "loss_schedules": self.loss_schedules,

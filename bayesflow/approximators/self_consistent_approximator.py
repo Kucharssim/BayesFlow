@@ -123,7 +123,7 @@ class SelfConsistentApproximator(Approximator):
 
         if not self.likelihood_network.built:
             likelihood_conditions_shape = concatenate_valid_shapes(
-                (data_shapes["parameters"], data_shapes.get("conditions"))
+                (data_shapes["parameters"], data_shapes.get("conditions")), axis=-1
             )
             if self.likelihood_summary:
                 self.likelihood_network.build(data_summary_shape, likelihood_conditions_shape)
@@ -131,7 +131,9 @@ class SelfConsistentApproximator(Approximator):
                 self.likelihood_network.build(data_shapes["data"], likelihood_conditions_shape)
 
         if not self.posterior_network.built:
-            posterior_conditions_shape = concatenate_valid_shapes((data_summary_shape, data_shapes.get("conditions")))
+            posterior_conditions_shape = concatenate_valid_shapes(
+                (data_summary_shape, data_shapes.get("conditions")), axis=-1
+            )
             self.posterior_network.build(data_shapes["parameters"], posterior_conditions_shape)
 
         # add fixed schedules if not defined
