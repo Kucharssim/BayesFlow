@@ -250,6 +250,7 @@ class SelfConsistentModelComparison(Approximator):
 
         logit_posterior = self.posterior_network(concatenate_valid((data_summary, conditions), axis=-1))
         log_evidences = self._evidences(data_summary if self.evidence_summary else data, conditions)
+        log_evidences = keras.ops.stop_gradient(log_evidences)
         log_prior = keras.ops.cast(self.log_prior, dtype=keras.ops.dtype(logit_posterior))
 
         log_ml = log_prior + log_evidences - logit_posterior
