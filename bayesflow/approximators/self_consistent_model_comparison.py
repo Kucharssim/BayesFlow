@@ -36,6 +36,7 @@ class SelfConsistentModelComparison(Approximator):
         self.adapter = adapter
 
         self.posterior_network = posterior_network
+        self.posterior_projector = keras.layers.Dense(num_models)
         self.evidence_network = evidence_network
 
         if prior_weights is None:
@@ -73,6 +74,9 @@ class SelfConsistentModelComparison(Approximator):
 
         if not self.posterior_network.built:
             self.posterior_network.build(posterior_network_conditions_shape)
+        if not self.posterior_projector.built:
+            posterior_output_shape = self.posterior_network.compute_output_shape(posterior_network_conditions_shape)
+            self.posterior_projector.build(posterior_output_shape)
 
         evidence_network_conditions_shape = concatenate_valid_shapes(
             [data_shapes.get("model_indices"), data_shapes.get("conditions")], axis=-1
@@ -188,7 +192,8 @@ class SelfConsistentModelComparison(Approximator):
         if isinstance(self.posterior_network, Distribution):
             return {}, keras.ops.zeros(())
 
-        logits = self.posterior_network(concatenate_valid((data, conditions), axis=-1), training=stage == "training")
+        outputs = self.posterior_network(concatenate_valid((data, conditions), axis=-1), training=stage == "training")
+        logits = self.posterior_projector(outputs, training=stage == "training")
         loss = keras.losses.categorical_crossentropy(model_indices, logits, from_logits=True)
 
         metrics = {"loss/posterior_loss": loss}
@@ -249,6 +254,7 @@ class SelfConsistentModelComparison(Approximator):
         data_summary = keras.ops.stop_gradient(data_summary)
 
         logit_posterior = self.posterior_network(concatenate_valid((data_summary, conditions), axis=-1))
+        logit_posterior = self.posterior_projector(logit_posterior)
         log_evidences = self._evidences(data_summary if self.evidence_summary else data, conditions)
         log_evidences = keras.ops.stop_gradient(log_evidences)
         log_prior = keras.ops.cast(self.log_prior, dtype=keras.ops.dtype(logit_posterior))
@@ -332,7 +338,8 @@ class SelfConsistentModelComparison(Approximator):
         if self.summary_network:
             data = self.summary_network(data)
 
-        logits = self.posterior_network(concatenate_valid((data, conditions), axis=-1), training=False)
+        outputs = self.posterior_network(concatenate_valid((data, conditions), axis=-1), training=False)
+        logits = self.posterior_projector(outputs, training=False)
 
         return logits
 
