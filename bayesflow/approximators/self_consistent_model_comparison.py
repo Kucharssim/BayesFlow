@@ -195,6 +195,7 @@ class SelfConsistentModelComparison(Approximator):
         outputs = self.posterior_network(concatenate_valid((data, conditions), axis=-1), training=stage == "training")
         logits = self.posterior_projector(outputs, training=stage == "training")
         loss = keras.losses.categorical_crossentropy(model_indices, logits, from_logits=True)
+        loss = keras.ops.mean(loss)
 
         metrics = {"loss/posterior_loss": loss}
 
