@@ -56,8 +56,11 @@ class SelfConsistentApproximator(Approximator):
     num_sc_samples: int
         Number of posterior samples over which to calculate
         the variance of the marginal likelihood approximation during training (for SC loss).
+    sc_gradient: str | Sequence[str] | None
+        Which network(s) should be trained by the SC loss. Can be either "all"
+        or any subset of ["posterior", "likelihood", "prior"]. Defaults to "posterior".
     likelihood_summary: bool
-        Whether or not is the likelihood computed on the output
+        Whether the likelihood is computed on the output
         of the summary network (`True`) or on the raw data (`False`).
         Note that when `True`, the `.log_marginal_likelihood` returns
         biased estimates that are not to be used for model comparison.
@@ -78,6 +81,7 @@ class SelfConsistentApproximator(Approximator):
         summary_network: SummaryNetwork = None,
         standardize: str | Sequence[str] | None = None,
         num_sc_samples: int = 16,
+        sc_gradient: str | Sequence[str] | None = "posterior",
         likelihood_summary: bool = False,
         loss_schedules: dict = None,
         **kwargs,
@@ -90,6 +94,13 @@ class SelfConsistentApproximator(Approximator):
         self.posterior_network = posterior_network
         self.summary_network = summary_network
         self.num_sc_samples = num_sc_samples
+        if isinstance(sc_gradient, str):
+            if standardize == "all":
+                self.sc_gradient = ["prior", "likelihood", "posterior"]
+            else:
+                self.sc_gradient = [sc_gradient]
+        else:
+            self.sc_gradient = sc_gradient or []
         if likelihood_summary and summary_network is None:
             raise ValueError("Summary network needs to be defined for computing the summary likelihood.")
         self.likelihood_summary = likelihood_summary
@@ -174,6 +185,7 @@ class SelfConsistentApproximator(Approximator):
             "summary_network": self.summary_network,
             "standardize": self.standardize,
             "num_sc_samples": self.num_sc_samples,
+            "sc_gradient": self.sc_gradient,
             "likelihood_summary": self.likelihood_summary,
             "loss_schedules": self.loss_schedules,
         }
@@ -454,6 +466,14 @@ class SelfConsistentApproximator(Approximator):
             conditions=concatenate_valid((parameters, conditions), axis=-1),
         )
         log_posterior = self.posterior_network.log_prob(samples=parameters, conditions=posterior_conditions)
+
+        # stop gradients for networks that we do not want to train by the SC loss
+        if "prior" not in self.sc_gradient:
+            log_prior = keras.ops.stop_gradient(log_prior)
+        if "likelihood" not in self.sc_gradient:
+            log_likelihood = keras.ops.stop_gradient(log_likelihood)
+        if "posterior" not in self.sc_gradient:
+            log_posterior = keras.ops.stop_gradient(log_posterior)
 
         # compute log marginal likelihood using the inverse bayes theorem
         # also then reshape back so that for every batch we have num_samples estimates of the log ml
