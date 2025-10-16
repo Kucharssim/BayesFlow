@@ -68,6 +68,8 @@ class SelfConsistentApproximator(Approximator):
         Scaling of the training losses. Can depend on the training step based on a custom schedule.
         The keys of the 4 loss components are:
         'prior_network', 'likelihood_network', 'posterior_network', 'summary_network', and 'self-consistency'
+        By default, will be set to 1.0. To turn off computing a loss entirely (e.g., for pure SC training),
+         set to False.
     **kwargs : dict, optional
         Additional arguments passed to the :py:class:`bayesflow.approximators.Approximator` class.
     """
@@ -193,11 +195,21 @@ class SelfConsistentApproximator(Approximator):
         return base_config | serialize(config)
 
     def _batch_size_from_data(self, data: any):
-        return keras.ops.shape(data["parameters"])[0]
+        """
+        Fetches the current batch size from an input dictionary. Can only be used during training when
+        inference variables as present. By default, assumes SBI loss is computed on 'parameters'. If
+        that is not found then SC loss only is assumed, in which case the batch size is computed from 'sc_data'.
+        """
+        if data.get("parameters") is not None:
+            return keras.ops.shape(data["parameters"])[0]
+        elif data.get("sc_data") is not None:
+            return keras.ops.shape(data["sc_data"])[0]
+        else:
+            raise ValueError("data does not contain parameters or sc_data, cannot infer batch size.")
 
     def compute_metrics(
         self,
-        parameters: Tensor,
+        parameters: Tensor = None,
         data: Tensor = None,
         conditions: Tensor = None,
         sc_data: Tensor = None,
@@ -288,6 +300,9 @@ class SelfConsistentApproximator(Approximator):
         if not isinstance(self.prior_network, InferenceNetwork):
             return {}, keras.ops.zeros(())
 
+        if self.loss_schedules["prior_network"] is False:
+            return {}, keras.ops.zeros(())
+
         metrics = self.prior_network.compute_metrics(parameters, conditions=conditions, stage=stage)
         loss = metrics.get("loss", keras.ops.zeros(()))
         metrics = {f"{key}/prior_{key}": value for key, value in metrics.items()}
@@ -307,6 +322,9 @@ class SelfConsistentApproximator(Approximator):
         self, data: Tensor, parameters: Tensor, conditions: Tensor, stage: str
     ) -> tuple[dict, float]:
         if not isinstance(self.likelihood_network, InferenceNetwork):
+            return {}, keras.ops.zeros(())
+
+        if self.loss_schedules["likelihood_network"] is False:
             return {}, keras.ops.zeros(())
 
         metrics = self.likelihood_network.compute_metrics(
@@ -332,6 +350,9 @@ class SelfConsistentApproximator(Approximator):
         if not isinstance(self.posterior_network, InferenceNetwork):
             return {}, keras.ops.zeros(())
 
+        if self.loss_schedules["posterior_network"] is False:
+            return {}, keras.ops.zeros(())
+
         metrics = self.posterior_network.compute_metrics(
             parameters, conditions=concatenate_valid((data, conditions), axis=-1), stage=stage
         )
@@ -350,15 +371,18 @@ class SelfConsistentApproximator(Approximator):
 
         return metrics, loss
 
-    def _summary_metrics(self, data: Tensor, stage: str) -> tuple[dict, float, Tensor]:
+    def _summary_metrics(self, data: Tensor, stage: str) -> tuple[dict, float, Tensor | None]:
         if self.summary_network is None:
             return {}, keras.ops.zeros(()), data
 
         if data is None:
-            raise ValueError("Sumary variables are required when summary network is present.")
+            return {}, keras.ops.zeros(()), data
 
         metrics = self.summary_network.compute_metrics(data, stage=stage)
         data = metrics.pop("outputs")
+
+        if self.loss_schedules["summary_network"] is False:
+            return {}, keras.ops.zeros(()), data
 
         loss = metrics.get("loss", keras.ops.zeros(()))
         metrics = {f"{key}/summary_{key}": value for key, value in metrics.items()}
@@ -377,6 +401,10 @@ class SelfConsistentApproximator(Approximator):
     def _self_consistency_metrics(self, data: Tensor, conditions: Tensor) -> tuple[dict, float]:
         if self.num_sc_samples == 0:
             return {}, keras.ops.zeros(())
+
+        if self.loss_schedules["self-consistency"] is False:
+            return {}, keras.ops.zeros(())
+
         log_ml = self._log_marginal_likelihood(num_samples=self.num_sc_samples, data=data, conditions=conditions)
         loss = keras.ops.var(log_ml, axis=-1)
         loss = keras.ops.mean(loss)
