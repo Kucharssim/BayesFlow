@@ -264,7 +264,7 @@ class SelfConsistentModelComparison(Approximator):
 
         return log_ml
 
-    def _evidences(self, data: Tensor, conditions: Tensor) -> Tensor:
+    def _evidences(self, data: Tensor, conditions: Tensor = None) -> Tensor:
         # for each data set, calculate evidence for each model
         batch_size = keras.ops.shape(data)[0]
         model_indices = keras.ops.eye(self.num_models)
@@ -352,15 +352,16 @@ class SelfConsistentModelComparison(Approximator):
         **kwargs,
     ) -> np.ndarray:
         """
-        Predicts pairwise Bayes factors given input conditions. The `conditions` dictionary is preprocessed
-        using the `adapter`. The output is converted to NumPy array after inference.
+        Predicts pairwise Bayes factors given input conditions using the posterior network.
+        The `conditions` dictionary is preprocessed using the `adapter`.
+        The output is converted to NumPy array after inference.
 
         Parameters
         ----------
         conditions : Mapping[str, np.ndarray]
             Dictionary of conditioning variables as NumPy arrays.
-        probs: bool, optional
-            A flag indicating whether model probabilities (True) or logits (False) are returned. Default is True.
+        log: bool, optional
+            A flag indicating whether Bayes factors are returned on a log scale. Default is True.
         **kwargs : dict
             Additional keyword arguments for the adapter and classifier.
 
@@ -388,3 +389,44 @@ class SelfConsistentModelComparison(Approximator):
             return log_bf
 
         return np.exp(log_bf)
+
+    def evidences(
+        self,
+        *,
+        conditions: Mapping[str, np.ndarray],
+        log: bool = True,
+        **kwargs,
+    ) -> np.ndarray:
+        """
+        Predicts evidences given input conditions using the evidence network.
+        The `conditions` dictionary is preprocessed using the `adapter`.
+        The output is converted to NumPy array after inference.
+
+        Parameters
+        ----------
+        conditions : Mapping[str, np.ndarray]
+            Dictionary of conditioning variables as NumPy arrays.
+        log: bool, optional
+            A flag indicating whether evidence is returned on a log scale. Default is True.
+        **kwargs : dict
+            Additional keyword arguments for the adapter and evidence network.
+
+        Returns
+        -------
+        outputs: np.ndarray
+            Predicted evidences given `conditions`.
+        """
+        # Apply adapter transforms to raw simulated / real quantities
+        conditions = self.adapter(conditions, strict=False, **kwargs)
+        conditions = keras.tree.map_structure(keras.ops.convert_to_tensor, conditions)
+
+        if self.summary_network and self.evidence_summary:
+            conditions["data"] = self.summary_network(conditions["data"])
+
+        output = self._evidences(**conditions, **kwargs)
+        output = keras.ops.convert_to_numpy(output)
+
+        if log:
+            return output
+
+        return np.exp(output)
