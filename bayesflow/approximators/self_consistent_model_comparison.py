@@ -26,6 +26,7 @@ class SelfConsistentModelComparison(Approximator):
         prior_weights: Sequence[float] = None,
         summary_network: SummaryNetwork = None,
         compute_sc: bool = True,
+        sc_gradient: str | Sequence[str] | None = "posterior",
         evidence_summary: bool = False,
         loss_schedules: dict = None,
         **kwargs,
@@ -52,6 +53,13 @@ class SelfConsistentModelComparison(Approximator):
         self.summary_network = summary_network
 
         self.compute_sc = compute_sc
+        if isinstance(sc_gradient, str):
+            if sc_gradient == "all":
+                self.sc_gradient = ["prior", "evidence", "posterior"]
+            else:
+                self.sc_gradient = [sc_gradient]
+        else:
+            self.sc_gradient = sc_gradient or []
         self.evidence_summary = evidence_summary
 
         if loss_schedules is None:
@@ -257,9 +265,15 @@ class SelfConsistentModelComparison(Approximator):
         logit_posterior = self.posterior_network(concatenate_valid((data_summary, conditions), axis=-1))
         logit_posterior = self.posterior_projector(logit_posterior)
         log_evidences = self._evidences(data_summary if self.evidence_summary else data, conditions)
-        log_evidences = keras.ops.stop_gradient(log_evidences)
         log_prior = keras.ops.cast(self.log_prior, dtype=keras.ops.dtype(logit_posterior))
 
+        if "prior" not in self.sc_gradient:
+            log_prior = keras.ops.stop_gradient(log_prior)
+        if "evidence" not in self.sc_gradient:
+            log_evidences = keras.ops.stop_gradient(log_evidences)
+        if "posterior" not in self.sc_gradient:
+            logit_posterior = keras.ops.stop_gradient(logit_posterior)
+            
         log_ml = log_prior + log_evidences - logit_posterior
 
         return log_ml

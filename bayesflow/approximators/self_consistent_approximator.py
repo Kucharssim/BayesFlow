@@ -97,7 +97,7 @@ class SelfConsistentApproximator(Approximator):
         self.summary_network = summary_network
         self.num_sc_samples = num_sc_samples
         if isinstance(sc_gradient, str):
-            if standardize == "all":
+            if sc_gradient == "all":
                 self.sc_gradient = ["prior", "likelihood", "posterior"]
             else:
                 self.sc_gradient = [sc_gradient]
